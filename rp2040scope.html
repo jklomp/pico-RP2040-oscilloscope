@@ -1,0 +1,780 @@
+<!DOCTYPE html>
+<html lang="en">
+<meta charset="UTF-8">
+<title>RP2040 scope</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="stylesheet" href="">
+<style>
+</style>
+<script>
+    var ports = []
+	var reader1, writer1
+    const starcode = 42
+	const slashcode = 47
+	var	txtimes=[]
+	var datareceived = true;
+	var txtime = performance.now();
+	var triglev = 100  // range 0..255
+	var adcSamples = []   // aligned adc values
+	var triggerIndex = 0;
+	var horTrigPct = 50   // trigger position, integer, range 10..90, % of sample buffer
+	var m1PosPct = 100    // position measuring line 1
+	var m2PosPct = 100    // position measuring line 2
+	var blankCount = 25   // do not use the first 25 samples
+	var txFrequencyFlag = true // send tx freq after startup
+	var g = {}            // grafic area, see setCanvasSize'
+	var roundrobin = 49   // '1' = select channel 1
+
+	function processMessage(data){
+		// general message format: /,*,command,data, ..... ,*,/
+		// measurement data: /,*,m,msg_id,trigger_index[4hex], hex,...hex,*,/
+		datareceived = true;
+	    var msg_id = data[3] - 48
+		document.getElementById('info4').innerHTML = `acquiring time: ${(performance.now() - txtimes[msg_id]).toFixed(0)} ms` 
+		if (document.getElementById("showhex").checked) {
+			var s = `rxlen=${data.length}<br>`
+			var count = 0;
+			for (var i =0; i < data.length; i+=2){
+				s += String.fromCharCode(data[i], data[i+1]) + ' '
+				if (count % 32 == 31) s +='<br>'
+				count ++;
+			}
+			document.getElementById('data').innerHTML = s
+		}	
+		else document.getElementById('data').innerHTML = ""		
+
+		var {trigger_index, values} = decodeRxData(data)
+		adcSamples = alignADCValues(trigger_index, values)
+		triggerIndex = trigger_index;
+		drawWave()	
+	}
+
+	function alignADCValues(trigger_index, values){
+		var samples = []
+		var sampleCount = values.length;
+		var startindex = (trigger_index == 0) ? 0 : Math.round(trigger_index - horTrigPct/100 * sampleCount);
+		if (startindex < 0) startindex +=sampleCount;
+		for (var i=startindex; i < startindex + sampleCount; i++){
+			var index = i
+			if (index >= sampleCount) index -= sampleCount;
+			samples.push(values[index])  // array with aligned samples
+		}
+		return samples
+	}
+
+	function decodeRxData(data){
+		// convert hex to array of values
+		var values = []
+		// skip data 0..3 : /,*,m,0
+		for (var i = 4; i < data.length - 2; i+=2){
+			var d1 = data[i] - 48   // 0..9, 
+			if (d1 > 9) d1 -= 7     // 10..15
+			var d2 = data[i+1] - 48 // 0..9, 
+			if (d2 > 9) d2 -= 7		// 10..15
+			values.push(d1 * 16 + d2)
+		}
+		var trigger_index = values[0] * 256 + values[1]
+		var extra1 = values[2] * 256 + values[3]
+		var extra2 = values[4] * 256 + values[5]
+		//document.getElementById("debug").innerHTML = `trigger_index=${trigger_index}, extra1=${extra1}, extra2=${extra2}`
+
+		// remove trigger_index + 2 extra items from data
+		values = values.slice(6)
+		
+		return {trigger_index, values};
+	}
+
+    function measureLinesDistance() {
+		var sampinput = document.getElementById("sampssec")
+		var sampssec = sampinput.innerHTML
+		return (Math.abs(m1PosPct - m2PosPct)/100 * adcSamples.length /sampssec).toFixed(2) + ' ms' // in ms  
+	}
+
+	function signalFrequency() {
+		if (adcSamples.length <= blankCount) return "0.00 Hz"
+		var dual = document.getElementById("selectch1and2").checked;
+		var sampinput = document.getElementById("sampssec")
+		var sampssec = sampinput.innerHTML * 1000
+		// get average, min & max
+		var sum = 0;
+		var min = 1000;
+		var max = -1000;
+		var step = dual ? 2 : 1;
+		for (var i=blankCount + 1; i < adcSamples.length - blankCount; i += step) {
+			var value = adcSamples[i];
+			sum += value;
+			if (value > max) max = value;
+			if (value < min) min = value;
+		}
+		var avg = sum/(adcSamples.length - 2 * blankCount)
+		var center = (max + min ) / 2;
+		var hys = (max-min) / 6;
+		var trigger = center + hys
+		var hys = center - hys;
+
+		// find positive slopes
+		var slopeIndexes = []
+		var hysok = false
+		for (var i=blankCount; i < adcSamples.length - blankCount; i++){
+			if (adcSamples[i] < hys) hysok = true;
+			if (hysok && adcSamples[i] >= trigger) {
+				slopeIndexes.push(i)
+				hysok=false;
+			}
+		}
+        if (slopeIndexes.length > 2){
+			var count = slopeIndexes[slopeIndexes.length-1] - slopeIndexes[0]
+			var freq = sampssec  / count * (slopeIndexes.length -1)
+		}
+		else freq = 0
+		var minmax = " " + (min / 255 * 3.3).toFixed(2) + "/" + (max / 255 * 3.3).toFixed(2) + " V";
+		if (freq >= 1000) return freq.toFixed(0) + ' Hz' + minmax// in Hz 
+		return freq.toFixed(1) + ' Hz' + minmax  // in Hz  
+	}
+
+	function drawTimeRaster(ctx){
+		var adcSampleCount = adcSamples.length
+		if (adcSampleCount > 0) {
+			var horzoom = document.getElementById("horzoom").value
+			var sampspersec = document.getElementById("sampssec").innerHTML * 1000
+			var fulltimerange = adcSampleCount / sampspersec * 1000000 // in us
+			var timerange = adcSampleCount / sampspersec * 1000000 / horzoom // in us
+			//document.getElementById("debug").innerHTML = timerange
+			var griddivs = [100,200,500,1000,2000,5000,10000,20000,50000,100000,200000,500000,1000000,2000000] // in us
+			
+			for (var i=0; i < griddivs.length; i++){
+				if (timerange / griddivs[i] <= 15) { // max 14 divisions 
+					var griddiv = griddivs[i] // in us
+					var scalestep = griddiv / 1000 // in ms
+					var scalevalue = 0
+					//document.getElementById("debug").innerHTML = griddiv/1000 +" ms/div"
+					var dotsPerUsec = g.w / fulltimerange
+                    var xstep = griddiv * dotsPerUsec
+					x = g.left + xstep // dots
+					ctx.textAlign = "center"
+					ctx.fillStyle= 'black'
+					ctx.font = "12px Arial"
+					var y1 = g.top
+					var y2  = y1 + g.h
+					ctx.beginPath()
+					do {
+						ctx.moveTo(x, y1)
+						ctx.lineTo(x, y2)
+						ctx.fillText(Math.round(scalevalue * 100) / 100, x, y2 + 15);
+						x += xstep 
+						scalevalue += scalestep;
+					} while (x < g.w)
+					ctx.strokeStyle= 'lightgray'
+					ctx.stroke();
+					break
+				}
+			}
+		}
+	}
+
+	function drawVerticalRaster(ctx) {
+		// height = 3.3V
+		var vstep = g.h / 6.6; // 0.5 V steps 
+		y = g.top + g.h - vstep;
+		ctx.textAlign = "right"
+		ctx.fillStyle= 'black'
+		ctx.font = "12px Arial"
+		var scalevalue = 0.5
+		ctx.beginPath()
+		while ( y > 0) {
+			ctx.moveTo(g.left, y)
+			ctx.lineTo(g.left + g.w, y)
+			ctx.fillText(scalevalue, g.left - 2, y + 5);
+			y = y - vstep
+			scalevalue += 0.5
+		}
+		ctx.strokeStyle= 'lightgray'
+		ctx.stroke();
+	}
+
+	function drawWave(){
+		var canvas = document.getElementById("canvas1");
+		var ctx = canvas.getContext("2d");
+		var dual = document.getElementById("selectch1and2").checked;
+		var ch1 = document.getElementById("selectch1").checked;
+		var ch2 = document.getElementById("selectch2").checked;
+		var trig1 = document.getElementById("trigch1").checked;
+		var trig2 = document.getElementById("trigch2").checked;
+		
+		// make graph
+		ctx.fillStyle = "#e0e0e0";
+		ctx.fillRect(0,0, g.width, g.height);
+		ctx.fillStyle = "#f8f8f8";
+		ctx.fillRect(g.left,g.top, g.w, g.h);
+		drawTimeRaster(ctx);	
+		drawVerticalRaster(ctx);
+		if (document.getElementById("selectch2").checked) ctx.strokeStyle = 'purple'
+		var sampleCount = adcSamples.length;  
+		var xstep = g.w / sampleCount
+        
+		var swapcolors = dual && trig2 && triggerIndex > 0; 
+		ctx.strokeStyle = swapcolors ? 'purple': 'blue';
+		var step = dual ? 2 : 1;
+        if  (dual || ch1) {
+			var offset = document.getElementById("gaincontainer1").scrollTop
+			var gain = document.getElementById("verzoom1").value / 10 // range 10 .. 100 = gain 1 .. 10
+			ctx.beginPath();
+			// do not show the first and last blankCount samples
+			for (var i=blankCount + 1; i < sampleCount - blankCount; i += step){
+				xpos = i * xstep
+				var y = (g.h - adcSamples[i]/255 * g.h) * gain  - offset;
+				if (i==0) ctx.moveTo(g.left+xpos,g.top+y);
+				else ctx.lineTo(g.left+xpos, g.top+y);
+			}
+			ctx.stroke();
+		}
+        if (dual || ch2) {
+			ctx.strokeStyle =  swapcolors ? 'blue':'purple';
+
+			var offset = document.getElementById("gaincontainer2").scrollTop
+		    var gain = document.getElementById("verzoom2").value / 10 // range 10 .. 100 = gain 1 .. 10
+			ctx.beginPath();
+			for (var i=blankCount; i < sampleCount - blankCount; i += step){
+				xpos = i * xstep
+				var y = (g.h - adcSamples[i]/255 * g.h) * gain - offset;
+				if (i==0) ctx.moveTo(g.left+xpos,g.top+y);
+				else ctx.lineTo(g.left+xpos, g.top+y);
+			}
+			ctx.stroke();
+		}
+
+		var {trig_xpos, trig_ypos, m1_xpos, m2_xpos} = positions()
+
+		// trigger position in green
+		ctx.beginPath();
+		ctx.moveTo(trig_xpos, g.top)
+		ctx.lineTo(trig_xpos, g.top + g.h)
+		ctx.strokeStyle = (downItem == "trigxpos" || moveItem == "trigxpos") ? 'red' : 'green'
+		ctx.stroke()
+
+		// trigger level in green/red
+		ctx.beginPath();
+		ctx.moveTo(0,trig_ypos)
+		ctx.lineTo(g.width,trig_ypos)
+		ctx.strokeStyle = (downItem == "triglev" || moveItem == "triglev") ? 'red' : 'green'
+		ctx.stroke()
+
+		// measure line 1
+		ctx.beginPath();
+		ctx.moveTo(m1_xpos, g.top)
+		ctx.lineTo(m1_xpos, g.top + g.h)
+		ctx.strokeStyle = (downItem == "m1xpos" || moveItem == "m1xpos") ? 'red' : 'purple'
+		ctx.stroke()
+
+		// measure line 1
+		ctx.beginPath();
+		ctx.moveTo(m2_xpos, g.top)
+		ctx.lineTo(m2_xpos, g.top+g.h)
+		ctx.strokeStyle = (downItem == "m2xpos" || moveItem == "m2xpos") ? 'red' : 'purple'
+		ctx.stroke()
+
+		document.getElementById("info1").innerHTML = signalFrequency()
+		document.getElementById("info2").innerHTML ="distance " + measureLinesDistance()
+
+	}
+	
+	function mousePos(event){
+		var rect = event.target.getBoundingClientRect();
+	    var x = event.clientX - rect.left
+    	var y = event.clientY - rect.top
+		return {x,y}		
+	}
+	function canvasMouseMove(event){
+		var {x,y} = mousePos(event)
+		var {trig_xpos, trig_ypos, m1_xpos, m2_xpos} = positions()
+       	//document.getElementById("debug").innerHTML = `x=${x}, y=${y}`
+ 	    if (downItem == "triglev") {
+			var dy = y - downPos.y
+			var change = dy / g.h * 255
+			triglev -= change; 
+			if (triglev < 0) triglev=0
+			if (triglev > 255) triglev = 255
+			downPos.y = y
+		}
+		if (downItem == "trigxpos") {
+			var minx = g.w * 0.1 + g.left
+			var maxx = g.w * 0.9 + g.left
+			var dx = x - downPos.x
+			if (x < minx || x > maxx) dx = 0 // update only when mouse pointer in allowed area
+
+			var change = dx / g.w * 100
+			horTrigPct += change; 
+			if (horTrigPct < 10) horTrigPct = 10
+			if (horTrigPct > 90) horTrigPct = 90
+			downPos.x = x
+		}
+
+		if (downItem == "m1xpos") {
+			var dx = x - downPos.x
+			var change = dx / g.w * 100
+			m1PosPct += change; 
+			if (m1PosPct < 0) m1PosPct = 0
+			if (m1PosPct > 100) m1PosPct = 100
+			downPos.x = x
+		}
+
+		if (downItem == "m2xpos") {
+			var dx = x - downPos.x
+			var change = dx / g.w * 100
+			m2PosPct += change; 
+			if (m2PosPct < 0) m2PosPct = 0
+			if (m2PosPct > 100) m2PosPct = 100
+			downPos.x = x
+		}
+		moveItem = downItem
+        // for color of hovered line
+		if (Math.abs(y - trig_ypos) < 6) moveItem = "triglev"
+		if (Math.abs(x - trig_xpos) < 6) moveItem = "trigxpos"		
+		if (Math.abs(x - m1_xpos) < 6) moveItem = "m1xpos"		
+		if (Math.abs(x - m2_xpos) < 6 ) moveItem = "m2xpos"	
+
+		if (moveItem != "" || lastMoveItem != moveItem)	drawWave()	
+		lastMoveItem = moveItem
+	}
+
+	var downPos = {}
+    var downItem = ""
+    var moveItem = "" 
+	var lastMoveItem = ""
+
+	function positions(){
+		var trig_x =  horTrigPct/100 * g.w
+		var trig_xpos = Math.round(g.left + trig_x) + 0.5
+		var m1_x =  m1PosPct/100 * g.w
+		var m1_xpos = Math.round(g.left + m1_x) + 0.5
+		var m2_x =  m2PosPct/100 * g.w
+		var m2_xpos = Math.round(g.left + m2_x) + 0.5
+		var trig_ypos = Math.round(g.h - triglev/255 * g.h + g.top)+0.5
+		return {trig_xpos, trig_ypos, m1_xpos, m2_xpos}
+	}
+
+	function canvasMouseDown(event){
+		downPos = mousePos(event)
+		var {trig_xpos, trig_ypos, m1_xpos, m2_xpos} = positions()
+		if (Math.abs(downPos.y - trig_ypos) < 6) downItem = "triglev"
+		if (Math.abs(downPos.x - trig_xpos) < 6) downItem = "trigxpos"	
+		if (Math.abs(downPos.x - m1_xpos) < 6) downItem = "m1xpos"		
+		if (Math.abs(downPos.x - m2_xpos) < 6) downItem = "m2xpos"		
+	}
+
+	function bodyMouseUp(event){
+		downItem=""
+	}
+
+	function valueAsHexToArray(value, array, arrayindex , digitcount){
+        var s = Math.round(value).toString(16).toUpperCase();
+        while (s.length < digitcount) s = '0' + s
+		for (var i=0; i < digitcount; i++){
+			array[arrayindex + i] = s.charCodeAt(i);
+		}
+	}
+	
+	async function enableport(){
+	    if ("serial" in navigator) {
+			var port = await navigator.serial.requestPort();
+		}
+	}
+
+    async function receive(){
+		var data = [];
+		var endOfMessage = -1;
+		do {
+			var { value, done } = await reader1.read();
+			data = [ ...data, ...value];
+			for (var i=0; i < data.length -1; i++) {
+				if (data[i] == starcode && data[i+1]== slashcode) endOfMessage = i;
+			}
+			if (endOfMessage >= 0){
+				var message = data.slice(0,endOfMessage + 2);
+				data = data.slice(endOfMessage + 2)
+				processMessage(message)
+				endOfMessage = -1;
+			}
+		} while (true)
+	}
+    
+	var message_id = 0
+	for (var i=0; i < 10; i++) txtimes[i]=performance.now();
+	
+	const FALSE = 48 // '0'
+	const TRUE = 49  // '1'
+	
+	var singleStepButtonFlag = false
+
+	function ssbuttonclick(){ // single step
+		singleStepButtonFlag = true;
+	}
+	
+    async function run(){
+	    // request format: '*',command,data,'/' 
+		
+		// command 'm' 
+		// byte 0 = '*'
+		// byte 1 = 'm'  start measuring cycle
+		// byte 2 = '0'..'9', sequence code
+		// byte 3 = '/'
+		
+		// command 'p'
+		// byte 0 = '*
+		// byte 1 = 'p' // parameters for capturing analog data
+		// byte 2,3 = trigger level in hex2
+		// byte 4,5,6,7 = sample speed divider in hex4 (96=500kS/s, 47999 = 1kS/s)
+		// byte 8 = trigger slope '0' = neg, '1' = pos
+		// byte 9 = trigger channel '0' = ch1, '1' = ch2
+		// byte 10,11 = dma_count multiplier, multiple of CAPTURE_DEPTH in hex2 == max acquiring time
+        // byte 12 = channelselect : '1' = ch1, '2' = ch2, '3' = ch1 + ch2
+        // byte 13,14 = horTrigPct, horizontal trigger position, 10..90% from sample range, value 10..90 in hex2
+		// byte 15 = '/'
+
+		// command 'f'  
+		// byte 0 = '*'
+		// byte 1 = 'f'  // pwm setting
+		// byte 2,3,4,5 = frequency in Hz
+		// byte 6,7 = duty cycle hex 2 0..100 % 
+		// byte 8 = '/'
+
+		if (!datareceived){
+			setTimeout(run,20)
+			var time1 = performance.now()
+			// check for time-out
+			if (time1 - txtime > 2500) datareceived=true;
+			return;
+		}
+
+		if (txFrequencyFlag) { // inital tc frequency
+			txFrequencyFlag = false;
+			await txFrequency()
+			setTimeout(run,20)	
+			return
+		}
+
+		if (document.getElementById("singleshot").checked) {
+			if (singleStepButtonFlag == false){
+				setTimeout(run,20)	
+				return			
+			}
+			singleStepButtonFlag = false
+		}
+
+		var measureCommand = new Uint8Array([42, 109, message_id + 48, 47]); // [*,m,0,/]
+		                                      //0   1  2  3  4  5  6  7  8  9 10 11 12 13 14 15
+		var parameterCommand = new Uint8Array([42,112, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,47]) // *,p,0...0,/
+		var dmaMultiplier = 4
+		var sampssec = document.getElementById("sampssec").innerHTML;
+		var sampleSpeedDivider = Math.round(500 * 96 / sampssec) - 1
+		if (sampleSpeedDivider < 96) sampleSpeedDivider = 0;
+		valueAsHexToArray(triglev, parameterCommand, 2 ,2)
+		valueAsHexToArray(sampleSpeedDivider, parameterCommand, 4 ,4)
+
+		var x = document.getElementById("posslope").checked
+		parameterCommand[8] = x + 48    // '1'= pos trigger slope, '0'= neg 
+
+		var x = document.getElementById("trigch1").checked
+		parameterCommand[9] = x + 48  // '0' = trigger on ch1, '1'= on ch2 
+
+		valueAsHexToArray(dmaMultiplier, parameterCommand, 10 ,2)
+
+		parameterCommand[12] = roundrobin  // '1' = ch1, '2' = ch2, '3' = ch1 + ch2
+					 
+		valueAsHexToArray(horTrigPct, parameterCommand, 13 ,2)
+		//document.getElementById("debug1").innerHTML = horTrigPct
+		txtime = performance.now()
+		txtimes[message_id] = txtime
+        await writer1.write(parameterCommand)
+		while (performance.now() - txtime < 1 ) {} // wait 1ms
+        await writer1.write(measureCommand)
+		setTimeout(run,100)
+		message_id = (message_id + 1) % 10
+		datareceived = false;
+	}
+
+	async function start(){
+		ports = await navigator.serial.getPorts();
+		//document.getElementById('info4').innerHTML = ports.length
+		if (ports.length == 1) {
+			await ports[0].open({baudRate:1500000, bufferSize:4096}) 
+			reader1 = ports[0].readable.getReader();
+			writer1 = ports[0].writable.getWriter();
+			document.getElementById("selectport").style.display = "none"
+            setTimeout(run,1)
+			receive(); // start receive loop
+		}
+		else setTimeout(start,333)
+	}
+
+	function setCanvasSize(id,width,height){
+		var canvas = document.getElementById(id)
+		canvas.setAttribute('width', width);
+		canvas.setAttribute('height', height);
+		canvas.style.width = width + 'px'
+		canvas.style.height = height + 'px'
+		// canvas layout
+		g = { // grafic area
+			top: 5,     // top border
+			left: 20,   // left border
+			right: 5,   // right border
+			bottom: 20, // bottom border
+			w : width - 25,   // drawing area: width - left - right
+			h : height - 25,  // drawing area: height - top - bottom
+			width, // canvas width
+			height // canvas height
+		}
+	}
+	
+	function onload(){	
+		document.getElementById("sampssecslider").oninput = function() {
+			var value = this.value;
+			var value1 = (value * value / 10000 / 20.04 + 1).toFixed(0)
+			document.getElementById("sampssec").innerHTML = value1
+			document.getElementById("sampssecdual").innerHTML = (value1 / 2).toFixed(0)
+		}
+		document.getElementById("horzoom").oninput = function() {
+			// range 1..10
+			setCanvasSize('canvas1',this.value * 800, 300)
+			drawWave()
+		}
+		document.getElementById("verzoom1").oninput = function(event) {
+			var value = event.target.value; // 10 ..50
+			document.getElementById("gainch1").style.height = 30 * value + "px";
+			drawWave()
+		}
+		document.getElementById("verzoom2").oninput = function(event) {
+			var value = event.target.value; // 10 ..50
+			document.getElementById("gainch2").style.height = 30 * value + "px";
+			drawWave()
+		}
+		document.getElementById("gaincontainer1").onscroll = function(event) {
+			drawWave()
+		}
+		document.getElementById("gaincontainer2").onscroll = function(event) {
+			drawWave()
+		}
+		setCanvasSize('canvas1',800,300)
+		document.getElementById('canvas1').addEventListener("mousemove",canvasMouseMove)		
+		document.getElementById('canvas1').addEventListener("mousedown",canvasMouseDown)
+		document.body.addEventListener("mouseup",bodyMouseUp)
+		drawWave()
+		start();
+	}
+	
+	async function txFrequency(event){
+		var freq = document.getElementById("wavefreq").value
+		if (freq < 10) {
+			document.getElementById("wavefreq").value = 10
+			freq = 10
+		}
+		var dc = document.getElementById("wavedc").value
+		var command = new Uint8Array([42, 102, 0, 0, 0, 0, 0, 0, 47]); // [*,f,hhhh,hh/]
+		valueAsHexToArray(freq, command, 2 ,4)
+		valueAsHexToArray(dc, command, 6 ,2)
+		await writer1.write(command)
+	}
+
+	function channelselect(n){
+        var e1 = document.getElementById("selectch1")
+		var e2 = document.getElementById("selectch2")
+		var e3 = document.getElementById("selectch1and2") 
+		var e4 = document.getElementById("trigch1")
+		var e5 = document.getElementById("trigch2")
+		if (n==1) {e1.checked = true; e2.checked = false; e3.checked = false}
+		if (n==2) {e1.checked = false; e2.checked = true; e3.checked = false}
+		if (n==3) {e1.checked = false; e2.checked = false; e3.checked = true}
+		if (e1.checked) {e4.checked = true; e5.checked=false;}
+		if (e2.checked) {e4.checked = false; e5.checked=true;}
+		if (n==4) {e4.checked = e1.checked || e3.checked; e5.checked = !e4.checked} 
+		if (n==5) {e5.checked = e2.cheched || e3.checked; e4.checked = !e5.checked}
+        roundrobin = e1.checked * 1 + e2.checked * 2 + e3.checked * 3 + 48  // '1'', '2'or '3'
+		if (e3.checked) {
+			document.getElementById("sampssec").style.display = "none"
+			document.getElementById("sampssecdual").style.display = "block"
+		} else {
+			document.getElementById("sampssec").style.display = "block"
+			document.getElementById("sampssecdual").style.display = "none"			
+		}
+	}
+	
+</script>
+<style>
+    body {
+		font-family:verdana;
+		font-size:13px;
+		-color: white;
+		-background-color: black;
+	}
+	.numinput {
+		width:60px;
+	}
+
+	#canvascontainer {
+		width : 800px;
+		overflow-x:scroll;
+		float:left;
+	}
+	.spacer {
+		width:30px;
+	}
+	.spacer1{
+		width:320px;
+	}
+	.zoomlabel {
+		margin-left: 20px;
+	}
+
+	.slider {
+		-webkit-appearance: none;
+		width: 140px;
+		height: 5px;
+		border-radius: 5px;
+		background: #d3d3d3;
+		outline: none;
+		opacity: 0.7;
+		-webkit-transition: .2s;
+		transition: opacity .2s;
+	}
+
+	.slider:hover {
+		opacity: 1;
+	}
+
+	.slider::-webkit-slider-thumb {
+		-webkit-appearance: none;
+		appearance: none;
+		width: 20px;
+		height: 20px;
+		border-radius: 50%;
+		background: gray;
+		cursor: pointer;
+	}
+
+	.slider::-moz-range-thumb {
+		width: 20px;
+		height: 20px;
+		border-radius: 50%;
+		background: gray;
+		cursor: pointer;
+	}
+	.content {
+		width: 850px;
+		margin:auto;
+	}
+	.clear {
+		clear: both;
+	}
+	.gaincontainer {
+		float:left;
+		width:20px;
+		height:300px;
+		overflow-y:scroll;
+	}
+    #verzoom1 {
+		margin-bottom: 10px;
+	}
+	#gainch1 {
+		height: 300px;
+		width: 1px;
+	}
+
+	#gainch2 {
+		height: 300px;
+		width: 1px;
+	}
+	#infobar td {
+		width:190px;
+	}
+	#datacontainer {
+		display:none;
+	}
+	#sampssecdual {
+		display:none;
+	}
+	.treedots{
+		font-size:18px;
+	}
+</style>
+
+<body onload="onload()">
+
+<div class="content">
+	<h1>Pico RP2040 oscilloscope / square wave generator</h1>
+	<div class="threedots" onclick="showmanual()">...</div>
+	<br>
+	<table>
+		<tr><td><button id="selectport" type="button" onclick="enableport()">select serial port</button></td>
+		</tr>
+		<tr><td>trigger on pos slope</td>
+			<td><input id="posslope" type="checkbox" checked></td>
+			<td></td>
+		</tr>
+		<tr><td>single shot</td>
+			<td><input id="singleshot" type="checkbox"></td>
+			<td><button id="ssbutton" type="button" onclick="ssbuttonclick()">acq</button></td>
+			<td class="spacer1"></td>
+			<td>square wave frequency</td>
+			<td><input class= "numinput" id="wavefreq" type="input" value="1000" onBlur="txFrequency()"></td>
+			<td>Hz</td>
+		</tr>
+		<tr><td>channel 1</td>
+			<td><input id="selectch1" type="checkbox" onclick="channelselect(1)" checked></td><td></td>
+			<td class="spacer1"></td>
+		    <td>square wave duty cycle</td>
+			<td><input class= "numinput" id="wavedc" type="input" value="50"  onBlur="txFrequency()"></td>
+			<td>%</td>
+		</tr>
+		<tr><td>channel 2</td>
+			<td><input id="selectch2" type="checkbox" onclick="channelselect(2)"></td>
+		</tr>
+		<tr><td>channel 1 and 2</td>
+			<td><input id="selectch1and2" type="checkbox" onclick="channelselect(3)"></td>
+		</tr>
+		<tr><td>trigger on ch1</td>
+			<td><input id="trigch1" type="checkbox" checked onclick="channelselect(4)"></td>
+		</tr>
+		<tr><td>trigger on ch2</td>
+			<td><input id="trigch2" type="checkbox" onclick="channelselect(5)"></td>
+		</tr>
+		<tr><td>sampling speed</td>
+			<td><span id="sampssec">500</span><span id = "sampssecdual">250</span></td>
+			<td>kS/s</td>
+		</tr> 
+	</table>
+	<table>
+    <tr>
+	<td></td><td></td><td></td><td></td><td></td>
+	<td class="spacer"></td><td>ch1 gain</td>
+	<td><input class="slider" id="verzoom1" type="range" min="10" max="50" value="10"></td>
+	</tr>
+	<tr>
+	<td>sampling speed</td>
+	<td  id="slider" ><input class="slider" id="sampssecslider" type="range" min="900" max="10000" value="10000"></td>
+	<td class="spacer"></td>
+	<td>horizontal zoom</td>
+	<td><input class="slider" id="horzoom" type="range" min="1" max="10" value="1"></td>
+	<td class="spacer"></td><td>ch2 gain</td>
+	<td><input class="slider" id="verzoom2" type="range" min="10" max="50" value="10"></td>
+    </tr></table>
+	<br>
+	<div id="canvascontainer"><canvas id="canvas1"></canvas></div>
+	<div id="gaincontainer1" class="gaincontainer"><div id="gainch1"></div></div>
+	<div id="gaincontainer2" class="gaincontainer"><div id="gainch2"></div></div>
+	<div class="clear"></div>
+	<table id="infobar"><tr>
+		<td id = "info1"></td>
+		<td id = "info2"></td>
+		<td id = "info3"></td>
+		<td id = "info4"></td>
+	</tr></table>
+	<div id="datacontainer">
+		<table>
+			<tr><td>show rx data</td><td><input id="showhex" type="checkbox"></td></tr>
+		</table>
+		<div id = "data" style="font-family:courier; font-size:12px"></div>
+	</div>
+</div>
+
+</body>
+</html>
